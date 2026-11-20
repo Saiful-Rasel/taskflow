@@ -76,12 +76,17 @@ if [[ "$MODE" != "deploy" && "$MODE" != "rollback" ]]; then
     exit 1
 fi
 
-for command in node npm pm2 aws jq curl tar psql nginx systemctl rsync; do
+for command in node npm pm2 aws jq curl tar psql nginx systemctl rsync find; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "ERROR: Required command missing: $command"
         exit 1
     fi
 done
+
+if ! sudo -n true >/dev/null 2>&1; then
+    echo "ERROR: Passwordless sudo is required for user '$APP_USER'."
+    exit 1
+fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "ERROR: Missing environment file: $ENV_FILE"
@@ -189,6 +194,14 @@ replace_symlink() {
     mv -Tf "$temporary_link" "$link"
 }
 
+stop_process_if_running() {
+    local proc="$1"
+    if pm2 describe "$proc" >/dev/null 2>&1; then
+        echo "Stopping previous PM2 process: $proc"
+        pm2 delete "$proc" >/dev/null || true
+    fi
+}
+
 # ----------------------------------------------------------
 # 5. Configure Nginx
 # ----------------------------------------------------------
@@ -198,7 +211,6 @@ configure_nginx() {
 
     sudo mkdir -p /etc/nginx/conf.d
 
-    # Ensure upstream exists before nginx -t on first deploy
     if [[ ! -f "$NGINX_UPSTREAM" ]]; then
         switch_upstream "$BLUE_PORT"
     fi
@@ -356,7 +368,6 @@ start_slot() {
 
     echo "Starting $slot slot (Port: $port, Process: $process)..."
 
-    # Delete old PM2 process if exists so --cwd always points to the new release directory
     if pm2 describe "$process" >/dev/null 2>&1; then
         pm2 delete "$process" >/dev/null
     fi
@@ -410,9 +421,13 @@ cleanup_old_releases() {
     blue_rel="$(get_release "blue" || true)"
     green_rel="$(get_release "green" || true)"
 
-    cd "$RELEASES_DIR"
-    for dir in $(ls -1dt */ 2>/dev/null | sed 's:/*$::' | tail -n +5); do
-        local full_path="$RELEASES_DIR/$dir"
+    mapfile -t candidate_dirs < <(
+        find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' |
+        sort -nr |
+        awk 'NR > 3 { $1=""; sub(/^ /, ""); print }'
+    )
+
+    for full_path in "${candidate_dirs[@]}"; do
         if [[ "$full_path" != "$blue_rel" && "$full_path" != "$green_rel" ]]; then
             echo "Cleaning up old release: $full_path"
             rm -rf "$full_path"
@@ -587,6 +602,11 @@ main() {
 
     DEPLOYMENT_SUCCEEDED=1
     SWITCH_ATTEMPTED=0
+
+    # Stop stale legacy single-process if it existed
+    if [[ "$OLD_SLOT" == "blue" ]] && pm2 describe "taskflow-api" >/dev/null 2>&1; then
+        stop_process_if_running "taskflow-api"
+    fi
 
     pm2 save
     cleanup_old_releases

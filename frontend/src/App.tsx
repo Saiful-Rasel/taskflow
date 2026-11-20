@@ -142,7 +142,7 @@ function App() {
       <header className="header">
         <div>
           <p className="eyebrow">PERSONAL PRODUCTIVITY</p>
-          <h1>TaskFlow<span>.</span></h1>
+          <h1>TaskFlow <span> version 2.0.</span></h1>
           <p className="subtitle">
             Organize your work. Focus on what matters.
           </p>

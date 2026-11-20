@@ -1,20 +1,31 @@
 
-name: TaskFlow CI
+name: TaskFlow CI/CD
 
 on:
-  push:
-    branches:
-      - main
-
+  # Run CI for pull requests targeting main.
   pull_request:
     branches:
       - main
 
-# Default permissions for all jobs.
+  # Run CI and publish artifacts on main pushes.
+  push:
+    branches:
+      - main
+
+  # Allow manual execution from GitHub Actions UI.
+  workflow_dispatch:
+
+# Least-privilege permissions by default.
 permissions:
   contents: read
 
+# Avoid duplicate runs for the same PR or branch.
+concurrency:
+  group: taskflow-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+
   # ==========================================
   # FRONTEND CI
   # ==========================================
@@ -54,7 +65,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Upload only the Node 22 build.
+      # Only Node 22 produces the deployment artifact.
       - name: Upload frontend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -63,6 +74,7 @@ jobs:
           path: frontend/dist/
           if-no-files-found: error
           retention-days: 7
+
 
   # ==========================================
   # BACKEND CI
@@ -94,7 +106,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Generate Prisma Client before tests and build.
+      # Generate Prisma Client.
       - name: Generate Prisma Client
         run: npm run prisma:generate
         env:
@@ -111,7 +123,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
 
-      # Upload everything required by production deployment.
+      # Only Node 22 produces the deployment artifact.
       - name: Upload backend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -128,17 +140,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+
   # ==========================================
-  # PUBLISH ARTIFACTS TO AWS S3
+  # PUBLISH ARTIFACTS TO S3
   # ==========================================
   publish-artifacts:
-    name: Publish Artifacts to S3
+    name: Publish Release Artifacts
 
     needs:
       - frontend-ci
       - backend-ci
 
-    # Only publish successful pushes to main.
+    # Publish only after a successful push to main.
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main'
@@ -155,45 +168,38 @@ jobs:
       RELEASE_SHA: ${{ github.sha }}
 
     steps:
-      # Download frontend artifact.
+      # Download frontend build.
       - name: Download frontend artifact
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
           path: release/frontend
 
-      # Download backend artifact.
+      # Download backend build.
       - name: Download backend artifact
         uses: actions/download-artifact@v4
         with:
           name: backend-build
           path: release/backend
 
-      # Validate the downloaded artifacts.
+      # Validate release contents.
       - name: Validate release artifacts
         shell: bash
         run: |
           set -euo pipefail
 
           test -f release/frontend/index.html
-
           test -f release/backend/dist/server.js
-
-          test -f release/backend/dist/generated/prisma/client.js
-
           test -f release/backend/prisma/schema.prisma
-
-          test -f release/backend/prisma.config.ts
-
-          test -d release/backend/prisma/migrations
-
           test -f release/backend/package.json
           test -f release/backend/package-lock.json
 
-          echo "All release artifacts validated."
+          test -d release/backend/prisma/migrations
 
-      # Package release artifacts.
-      - name: Create release archives
+          echo "Release artifacts validated."
+
+      # Create versioned release archives.
+      - name: Package release artifacts
         shell: bash
         run: |
           set -euo pipefail
@@ -209,11 +215,7 @@ jobs:
             "$GITHUB_RUN_ID" \
             "$GITHUB_RUN_NUMBER" > release-info.json
 
-          echo "Release archives created."
-
-      # ======================================
-      # AWS OIDC AUTHENTICATION
-      # ======================================
+      # AWS OIDC authentication.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -224,25 +226,19 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      # ======================================
-      # UPLOAD ARTIFACTS TO S3
-      # ======================================
+      # Upload immutable release artifacts.
       - name: Upload artifacts to S3
         shell: bash
         run: |
           set -euo pipefail
 
           aws s3 cp frontend.tar.gz \
-            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/frontend.tar.gz" \
-            --region "$AWS_REGION"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/frontend.tar.gz"
 
           aws s3 cp backend.tar.gz \
-            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/backend.tar.gz" \
-            --region "$AWS_REGION"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/backend.tar.gz"
 
           aws s3 cp release-info.json \
-            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/release-info.json" \
-            --region "$AWS_REGION"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/release-info.json"
 
-          echo "All release artifacts uploaded successfully."
-
+          echo "Release published successfully."

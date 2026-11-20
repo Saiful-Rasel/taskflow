@@ -51,7 +51,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Upload one artifact from Node 22 to avoid duplicate artifacts.
+      # Upload one artifact from Node 22 to avoid duplicates.
       - name: Upload frontend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -88,6 +88,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Prisma config requires DATABASE_URL.
+      # Client generation does not connect to PostgreSQL.
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
+
       - name: Run ESLint
         run: npm run lint
 
@@ -96,7 +103,10 @@ jobs:
 
       - name: Build backend
         run: npm run build
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
 
+      # Upload one artifact from Node 22 to avoid duplicates.
       - name: Upload backend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -104,6 +114,7 @@ jobs:
           name: backend-build
           path: |
             backend/dist/
+            backend/src/generated/prisma/
             backend/package.json
             backend/package-lock.json
             backend/prisma/

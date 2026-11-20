@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
@@ -47,7 +46,7 @@ GREEN_PORT=5001
 BLUE_PROCESS="taskflow-api-blue"
 GREEN_PROCESS="taskflow-api-green"
 
-MODE="${1:-deploy}"
+MODE="${1:-}"
 COMMIT_SHA="${2:-}"
 
 # ----------------------------------------------------------
@@ -55,7 +54,6 @@ COMMIT_SHA="${2:-}"
 # ----------------------------------------------------------
 
 if [[ "$(id -un)" != "$APP_USER" ]]; then
-
     if [[ "$EUID" -eq 0 ]]; then
         exec sudo -iu "$APP_USER" env \
             "AWS_REGION=$AWS_REGION" \
@@ -71,10 +69,14 @@ fi
 # 3. Basic validation
 # ----------------------------------------------------------
 
-for command in \
-    node npm pm2 aws jq curl tar psql \
-    nginx systemctl rsync
-do
+if [[ "$MODE" != "deploy" && "$MODE" != "rollback" ]]; then
+    echo "Usage:"
+    echo "./deploy.sh deploy <COMMIT_SHA>"
+    echo "./deploy.sh rollback"
+    exit 1
+fi
+
+for command in node npm pm2 aws jq curl tar psql nginx systemctl rsync; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "ERROR: Required command missing: $command"
         exit 1
@@ -87,24 +89,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 mkdir -p "$SHARED_DIR" "$RELEASES_DIR" "$STATE_DIR"
-
 chmod 600 "$ENV_FILE"
 
-# Load application environment.
-# These variables are passed to Prisma and PM2.
 set -a
 source "$ENV_FILE"
 set +a
 
 if [[ -z "${DATABASE_URL:-}" ]]; then
-    echo "ERROR: DATABASE_URL is missing."
-    exit 1
-fi
-
-if [[ "$MODE" != "deploy" && "$MODE" != "rollback" ]]; then
-    echo "Usage:"
-    echo "./deploy.sh deploy <COMMIT_SHA>"
-    echo "./deploy.sh rollback"
+    echo "ERROR: DATABASE_URL is missing in $ENV_FILE."
     exit 1
 fi
 
@@ -139,9 +131,7 @@ get_other_slot() {
 get_release() {
     local slot="$1"
     local file="$STATE_DIR/slot-release-$slot"
-
     [[ -f "$file" ]] || return 1
-
     cat "$file"
 }
 
@@ -152,16 +142,11 @@ check_health() {
     echo "Checking $name on port $port..."
 
     for attempt in {1..15}; do
-
-        if curl -fsS \
-            --max-time 5 \
-            "http://127.0.0.1:$port/health" >/dev/null; then
-
+        if curl -fsS --max-time 5 "http://127.0.0.1:$port/health" >/dev/null; then
             echo "PASS: $name is healthy."
             return 0
         fi
-
-        echo "Attempt $attempt/15 failed."
+        echo "Attempt $attempt/15 failed. Retrying in 2s..."
         sleep 2
     done
 
@@ -169,11 +154,9 @@ check_health() {
     return 1
 }
 
-# Atomically replace the Nginx upstream configuration.
 switch_upstream() {
     local port="$1"
     local temp_file
-
     temp_file="$(mktemp)"
 
     cat > "$temp_file" <<EOF
@@ -183,6 +166,7 @@ upstream taskflow_backend {
 }
 EOF
 
+    sudo mkdir -p /etc/nginx/conf.d
     sudo install -m 644 "$temp_file" "$NGINX_UPSTREAM"
     rm -f "$temp_file"
 
@@ -192,20 +176,16 @@ EOF
     fi
 
     sudo systemctl reload nginx
-
     echo "Nginx traffic now points to port $port."
 }
 
-# Atomically update a symlink.
 replace_symlink() {
     local target="$1"
     local link="$2"
     local temporary_link="${link}.new"
 
     rm -f "$temporary_link"
-
     ln -s "$target" "$temporary_link"
-
     mv -Tf "$temporary_link" "$link"
 }
 
@@ -214,10 +194,14 @@ replace_symlink() {
 # ----------------------------------------------------------
 
 configure_nginx() {
-
     echo "Configuring Nginx..."
 
     sudo mkdir -p /etc/nginx/conf.d
+
+    # Ensure upstream exists before nginx -t on first deploy
+    if [[ ! -f "$NGINX_UPSTREAM" ]]; then
+        switch_upstream "$BLUE_PORT"
+    fi
 
     sudo tee "$NGINX_SITE" >/dev/null <<'NGINX'
 server {
@@ -227,35 +211,48 @@ server {
     root /var/www/taskflow;
     index index.html;
 
+    # Cache static assets aggressively (Vite hashed files)
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # Never cache index.html so new releases load immediately
+    location = /index.html {
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+        try_files $uri =404;
+    }
+
+    # React SPA routing
     location / {
         try_files $uri $uri/ /index.html;
     }
 
+    # Backend API proxy
     location /api/ {
         proxy_pass http://taskflow_backend;
-
         proxy_http_version 1.1;
 
+        proxy_set_header Connection "";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # ALB & local health check
     location /health {
         proxy_pass http://taskflow_backend;
-
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
         proxy_set_header Host $host;
     }
 }
 NGINX
 
     sudo ln -sfn "$NGINX_SITE" "$NGINX_ENABLED"
-
     sudo rm -f /etc/nginx/sites-enabled/default
-
-    # The initial upstream is configured separately.
-    # Ubuntu Nginx loads conf.d files inside the http context.
 
     sudo nginx -t
     sudo systemctl enable --now nginx
@@ -266,64 +263,51 @@ NGINX
 # ----------------------------------------------------------
 
 prepare_release() {
-
     if [[ ! "$COMMIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-        echo "ERROR: Invalid commit SHA."
+        echo "ERROR: Invalid commit SHA: '$COMMIT_SHA'"
         exit 1
     fi
 
     RELEASE_DIR="$RELEASES_DIR/$COMMIT_SHA"
     STAGING_DIR="$RELEASES_DIR/.${COMMIT_SHA}.staging"
-
     ARTIFACT_PREFIX="releases/$COMMIT_SHA"
 
     if [[ -d "$RELEASE_DIR" ]]; then
-
         echo "Release already exists. Validating..."
-
         if [[ -f "$RELEASE_DIR/frontend/index.html" &&
               -f "$RELEASE_DIR/backend/dist/server.js" &&
               -f "$RELEASE_DIR/backend/package.json" &&
               -f "$RELEASE_DIR/backend/package-lock.json" &&
               -f "$RELEASE_DIR/backend/prisma/schema.prisma" &&
               -d "$RELEASE_DIR/backend/prisma/migrations" ]]; then
-
             echo "Existing release is complete."
             return 0
         fi
-
         echo "Incomplete release. Removing it..."
         rm -rf "$RELEASE_DIR"
     fi
 
     rm -rf "$STAGING_DIR"
-
-    mkdir -p "$STAGING_DIR/frontend"
-    mkdir -p "$STAGING_DIR/backend"
+    mkdir -p "$STAGING_DIR/frontend" "$STAGING_DIR/backend"
 
     echo "Downloading frontend artifact..."
-
     aws s3 cp \
         "s3://$S3_BUCKET/$ARTIFACT_PREFIX/frontend.tar.gz" \
         "$STAGING_DIR/frontend.tar.gz" \
         --region "$AWS_REGION"
 
     echo "Downloading backend artifact..."
-
     aws s3 cp \
         "s3://$S3_BUCKET/$ARTIFACT_PREFIX/backend.tar.gz" \
         "$STAGING_DIR/backend.tar.gz" \
         --region "$AWS_REGION"
 
     echo "Extracting artifacts..."
+    tar -xzf "$STAGING_DIR/frontend.tar.gz" -C "$STAGING_DIR/frontend"
+    tar -xzf "$STAGING_DIR/backend.tar.gz" -C "$STAGING_DIR/backend"
 
-    tar -xzf "$STAGING_DIR/frontend.tar.gz" \
-        -C "$STAGING_DIR/frontend"
+    rm -f "$STAGING_DIR/frontend.tar.gz" "$STAGING_DIR/backend.tar.gz"
 
-    tar -xzf "$STAGING_DIR/backend.tar.gz" \
-        -C "$STAGING_DIR/backend"
-
-    # Validate artifact contents before publishing the release.
     test -f "$STAGING_DIR/frontend/index.html"
     test -f "$STAGING_DIR/backend/dist/server.js"
     test -f "$STAGING_DIR/backend/package.json"
@@ -332,7 +316,6 @@ prepare_release() {
     test -d "$STAGING_DIR/backend/prisma/migrations"
 
     mv "$STAGING_DIR" "$RELEASE_DIR"
-
     echo "Release prepared: $RELEASE_DIR"
 }
 
@@ -341,21 +324,16 @@ prepare_release() {
 # ----------------------------------------------------------
 
 prepare_backend() {
-
     local backend_dir="$1"
 
     echo "Installing production dependencies..."
-
     cd "$backend_dir"
 
     export NODE_OPTIONS="--max-old-space-size=384"
-
     npm ci --omit=dev --no-audit --no-fund
 
-    echo "Running Prisma migrations..."
-
-    # Keep migrations backward-compatible with the currently
-    # serving version. See the migration warning below.
+    echo "Generating Prisma client & running migrations..."
+    npx prisma generate
     npx prisma migrate deploy
 
     echo "Database migrations completed."
@@ -366,44 +344,31 @@ prepare_backend() {
 # ----------------------------------------------------------
 
 start_slot() {
-
     local slot="$1"
     local release="$2"
 
     local port
     local process
-
     port="$(get_port "$slot")"
     process="$(get_process "$slot")"
 
     local backend_dir="$release/backend"
 
-    echo "Starting $slot slot..."
-    echo "Port: $port"
-    echo "Process: $process"
+    echo "Starting $slot slot (Port: $port, Process: $process)..."
 
-    # Ensure the app has its own release directory.
-    # It must not depend on the mutable current symlink.
-
+    # Delete old PM2 process if exists so --cwd always points to the new release directory
     if pm2 describe "$process" >/dev/null 2>&1; then
-
-        PORT="$port" \
-        NODE_ENV=production \
-        pm2 restart "$process" \
-            --update-env
-
-    else
-
-        PORT="$port" \
-        NODE_ENV=production \
-        pm2 start "$backend_dir/dist/server.js" \
-            --name "$process" \
-            --cwd "$backend_dir" \
-            --update-env
+        pm2 delete "$process" >/dev/null
     fi
 
-    pm2 save
+    PORT="$port" \
+    NODE_ENV=production \
+    pm2 start "$backend_dir/dist/server.js" \
+        --name "$process" \
+        --cwd "$backend_dir" \
+        --update-env
 
+    pm2 save
     check_health "$port" "$slot"
 }
 
@@ -412,18 +377,12 @@ start_slot() {
 # ----------------------------------------------------------
 
 switch_frontend() {
-
     local release="$1"
     local frontend_release="$release/frontend"
 
     test -f "$frontend_release/index.html"
 
-    # One-time migration:
-    # Preserve an existing real frontend directory before
-    # converting /var/www/taskflow into a release symlink.
-
     if [[ -d "$FRONTEND_DIR" && ! -L "$FRONTEND_DIR" ]]; then
-
         if [[ ! -d "$LEGACY_FRONTEND" ]]; then
             sudo mv "$FRONTEND_DIR" "$LEGACY_FRONTEND"
         else
@@ -434,11 +393,8 @@ switch_frontend() {
     sudo mkdir -p "$(dirname "$FRONTEND_DIR")"
 
     local temporary_link="${FRONTEND_DIR}.new"
-
     sudo rm -f "$temporary_link"
-
     sudo ln -s "$frontend_release" "$temporary_link"
-
     sudo mv -Tf "$temporary_link" "$FRONTEND_DIR"
 
     sudo nginx -t
@@ -446,58 +402,73 @@ switch_frontend() {
 }
 
 # ----------------------------------------------------------
-# 10. Manual rollback
+# 10. Cleanup old releases (keep active slots + latest 3)
+# ----------------------------------------------------------
+
+cleanup_old_releases() {
+    local blue_rel green_rel
+    blue_rel="$(get_release "blue" || true)"
+    green_rel="$(get_release "green" || true)"
+
+    cd "$RELEASES_DIR"
+    for dir in $(ls -1dt */ 2>/dev/null | sed 's:/*$::' | tail -n +5); do
+        local full_path="$RELEASES_DIR/$dir"
+        if [[ "$full_path" != "$blue_rel" && "$full_path" != "$green_rel" ]]; then
+            echo "Cleaning up old release: $full_path"
+            rm -rf "$full_path"
+        fi
+    done
+}
+
+# ----------------------------------------------------------
+# 11. Manual rollback
 # ----------------------------------------------------------
 
 manual_rollback() {
-
     if [[ ! -f "$STATE_DIR/active-slot" ]]; then
         echo "ERROR: No active slot state found."
         exit 1
     fi
 
-    local active_slot
-    local rollback_slot
-    local rollback_release
-    local rollback_port
-    local rollback_process
+    local active_slot rollback_slot rollback_release rollback_port rollback_process
 
     active_slot="$(cat "$STATE_DIR/active-slot")"
     rollback_slot="$(get_other_slot "$active_slot")"
 
     rollback_release="$(get_release "$rollback_slot")" || {
-        echo "ERROR: No previous release available."
+        echo "ERROR: No previous release available for $rollback_slot."
         exit 1
     }
+
+    if [[ ! -d "$rollback_release" ]]; then
+        echo "ERROR: Rollback release directory missing: $rollback_release"
+        exit 1
+    fi
 
     rollback_port="$(get_port "$rollback_slot")"
     rollback_process="$(get_process "$rollback_slot")"
 
-    echo "Rolling back from $active_slot to $rollback_slot..."
+    echo "Rolling back from $active_slot to $rollback_slot ($rollback_release)..."
 
     if ! pm2 describe "$rollback_process" >/dev/null 2>&1; then
-        echo "ERROR: Previous PM2 process is unavailable."
+        echo "ERROR: Previous PM2 process ($rollback_process) is unavailable."
         exit 1
     fi
 
     check_health "$rollback_port" "$rollback_slot"
 
+    switch_frontend "$rollback_release"
     switch_upstream "$rollback_port"
-
-    switch_frontend "$RELEASES_DIR/$rollback_release"
-
-    replace_symlink \
-        "$RELEASES_DIR/$rollback_release" \
-        "$CURRENT_LINK"
+    replace_symlink "$rollback_release" "$CURRENT_LINK"
 
     echo "$rollback_slot" > "$STATE_DIR/active-slot"
 
     echo "Manual rollback successful."
-    echo "Active slot: $rollback_slot"
+    echo "Active slot: $rollback_slot (Port: $rollback_port)"
 }
 
 # ----------------------------------------------------------
-# 11. Deployment rollback handler
+# 12. Deployment rollback handler
 # ----------------------------------------------------------
 
 OLD_SLOT=""
@@ -511,7 +482,6 @@ SWITCH_ATTEMPTED=0
 DEPLOYMENT_SUCCEEDED=0
 
 rollback_on_failure() {
-
     local exit_code=$?
 
     if [[ "$DEPLOYMENT_SUCCEEDED" -eq 1 ]]; then
@@ -524,25 +494,16 @@ rollback_on_failure() {
     echo "======================================"
 
     if [[ "$SWITCH_ATTEMPTED" -eq 1 && -n "$OLD_PORT" ]]; then
+        echo "Restoring previous frontend & Nginx upstream..."
 
-        echo "Restoring previous Nginx upstream..."
-
-        if [[ -n "$OLD_RELEASE" ]]; then
-
+        if [[ -n "$OLD_RELEASE" && -d "$OLD_RELEASE" ]]; then
+            switch_frontend "$OLD_RELEASE" || true
             switch_upstream "$OLD_PORT" || true
+            replace_symlink "$OLD_RELEASE" "$CURRENT_LINK" || true
 
-            if [[ -d "$RELEASES_DIR/$OLD_RELEASE" ]]; then
-
-                switch_frontend \
-                    "$RELEASES_DIR/$OLD_RELEASE" || true
-
-                replace_symlink \
-                    "$RELEASES_DIR/$OLD_RELEASE" \
-                    "$CURRENT_LINK" || true
+            if [[ -n "$OLD_SLOT" ]]; then
+                echo "$OLD_SLOT" > "$STATE_DIR/active-slot"
             fi
-
-            echo "$OLD_SLOT" > "$STATE_DIR/active-slot"
-
         fi
     fi
 
@@ -557,11 +518,10 @@ rollback_on_failure() {
 trap rollback_on_failure ERR
 
 # ----------------------------------------------------------
-# 12. Main deployment
+# 13. Main deployment
 # ----------------------------------------------------------
 
 main() {
-
     echo "======================================"
     echo "TaskFlow Blue-Green Deployment"
     echo "======================================"
@@ -572,37 +532,23 @@ main() {
     fi
 
     prepare_release
-
     TARGET_RELEASE="$RELEASE_DIR"
 
-    # Detect the currently active slot.
     if [[ -f "$STATE_DIR/active-slot" ]]; then
-
         OLD_SLOT="$(cat "$STATE_DIR/active-slot")"
-
     elif pm2 describe "taskflow-api" >/dev/null 2>&1 &&
          curl -fsS "http://127.0.0.1:$BLUE_PORT/health" >/dev/null; then
-
-        # First migration from the legacy single-process setup.
         OLD_SLOT="blue"
-
         echo "Legacy taskflow-api detected on port 5000."
-
     else
-
         OLD_SLOT=""
     fi
 
     if [[ -n "$OLD_SLOT" ]]; then
-
         OLD_PORT="$(get_port "$OLD_SLOT")"
-
         OLD_RELEASE="$(get_release "$OLD_SLOT" || true)"
-
         TARGET_SLOT="$(get_other_slot "$OLD_SLOT")"
-
     else
-
         TARGET_SLOT="blue"
     fi
 
@@ -612,52 +558,29 @@ main() {
     echo "Target slot: $TARGET_SLOT"
     echo "Target port: $TARGET_PORT"
 
-    # Do not proceed if the currently serving application
-    # is already unhealthy.
     if [[ -n "$OLD_SLOT" ]]; then
         check_health "$OLD_PORT" "$OLD_SLOT"
     fi
 
     configure_nginx
-
     prepare_backend "$TARGET_RELEASE/backend"
-
-    # Start the new version without touching the active slot.
     start_slot "$TARGET_SLOT" "$TARGET_RELEASE"
 
-    # New backend is healthy. Now switch the traffic.
     SWITCH_ATTEMPTED=1
 
     switch_frontend "$TARGET_RELEASE"
-
     switch_upstream "$TARGET_PORT"
 
-    # Update active release pointer and deployment state.
     replace_symlink "$TARGET_RELEASE" "$CURRENT_LINK"
-
     echo "$TARGET_RELEASE" > "$STATE_DIR/slot-release-$TARGET_SLOT"
-
     echo "$TARGET_SLOT" > "$STATE_DIR/active-slot"
 
-    # Verify traffic through Nginx after switching.
-    if ! curl -fsS \
-        --retry 5 \
-        --retry-delay 2 \
-        --retry-connrefused \
-        --max-time 5 \
-        http://127.0.0.1/health >/dev/null; then
-
+    if ! curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 5 http://127.0.0.1/health >/dev/null; then
         echo "ERROR: Nginx backend health check failed."
         return 1
     fi
 
-    if ! curl -fsS \
-        --retry 5 \
-        --retry-delay 2 \
-        --retry-connrefused \
-        --max-time 5 \
-        http://127.0.0.1/ >/dev/null; then
-
+    if ! curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 5 http://127.0.0.1/ >/dev/null; then
         echo "ERROR: Frontend health check failed."
         return 1
     fi
@@ -666,17 +589,16 @@ main() {
     SWITCH_ATTEMPTED=0
 
     pm2 save
+    cleanup_old_releases
 
     echo ""
     echo "======================================"
     echo "DEPLOYMENT SUCCESSFUL"
     echo "======================================"
-
     echo "Commit: $COMMIT_SHA"
     echo "Active slot: $TARGET_SLOT"
     echo "Active port: $TARGET_PORT"
     echo "Release: $TARGET_RELEASE"
-
     echo ""
     pm2 status
 }

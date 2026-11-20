@@ -1,24 +1,17 @@
 import { Router } from "express";
 
-import {
-  getTasks,
-  createTask,
-  updateTask,
-  deleteTask,
-} from "./task.controller.js";
+import { createTaskController } from "./task.controller.js";
+import type { TaskServiceContract } from "./task.types.js";
 
-const router = Router();
+export function createTaskRoutes(service: TaskServiceContract) {
+  const router = Router();
 
-// GET all tasks.
-router.get("/", getTasks);
+  const controller = createTaskController(service);
 
-// Create a task.
-router.post("/", createTask);
+  router.get("/", controller.getTasks);
+  router.post("/", controller.createTask);
+  router.patch("/:id", controller.updateTask);
+  router.delete("/:id", controller.deleteTask);
 
-// Update a task.
-router.patch("/:id", updateTask);
-
-// Delete a task.
-router.delete("/:id", deleteTask);
-
-export default router;
+  return router;
+}

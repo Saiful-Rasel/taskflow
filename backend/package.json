@@ -7,10 +7,11 @@
     "test": "vitest run",
     "postinstall": "prisma skills sync || exit 0",
     "dev": "tsx watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run prisma:generate && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test:watch": "vitest",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "prisma:generate": "prisma generate"
   },
   "keywords": [],
   "author": "",

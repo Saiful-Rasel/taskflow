@@ -5,6 +5,12 @@ on:
     workflows: ["TaskFlow CI"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "40-character commit SHA to deploy"
+        required: true
+        type: string
 
 concurrency:
   group: taskflow-production
@@ -19,10 +25,13 @@ jobs:
     runs-on: ubuntu-latest
 
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
 
     environment:
       name: production
@@ -45,7 +54,7 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       S3_BUCKET: ${{ vars.S3_BUCKET }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      RELEASE_SHA: ${{ inputs.commit_sha || github.event.workflow_run.head_sha }}
 
     steps:
       - name: Validate deployment configuration
@@ -95,7 +104,7 @@ jobs:
           set -Eeuo pipefail
 
           printf -v remote_script \
-            'cd /opt/taskflow && ./deploy.sh deploy %q' \
+            'cd /opt/taskflow/shared && ./deploy.sh deploy %q' \
             "$RELEASE_SHA"
 
           printf -v remote_command \

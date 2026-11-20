@@ -1,5 +1,5 @@
 
-name: TaskFlow CI/CD
+name: TaskFlow CI
 
 on:
   # Run CI for pull requests targeting main.

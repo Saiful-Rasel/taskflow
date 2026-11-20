@@ -10,11 +10,14 @@ on:
     branches:
       - main
 
-# Restrict workflow permissions to the minimum required.
+# Default permissions for CI jobs.
 permissions:
   contents: read
 
 jobs:
+  # ------------------------------------------
+  # FRONTEND CI
+  # ------------------------------------------
   frontend-ci:
     name: Frontend CI (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -51,7 +54,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Upload one artifact from Node 22 to avoid duplicates.
+      # Upload only once from Node 22.
       - name: Upload frontend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -61,6 +64,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ------------------------------------------
+  # BACKEND CI
+  # ------------------------------------------
   backend-ci:
     name: Backend CI (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -88,8 +94,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Prisma config requires DATABASE_URL.
-      # Client generation does not connect to PostgreSQL.
+      # Prisma Client generation does not require a running database.
       - name: Generate Prisma Client
         run: npm run prisma:generate
         env:
@@ -106,7 +111,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
 
-      # Upload one artifact from Node 22 to avoid duplicates.
+      # Upload only once from Node 22.
       - name: Upload backend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -120,3 +125,73 @@ jobs:
             backend/prisma/
           if-no-files-found: error
           retention-days: 7
+
+  # ------------------------------------------
+  # PUBLISH ARTIFACTS TO AWS S3
+  # ------------------------------------------
+  publish-artifacts:
+    name: Publish Artifacts to S3
+
+    # Run only after both CI jobs succeed.
+    needs:
+      - frontend-ci
+      - backend-ci
+
+    # Never upload artifacts from pull requests.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    # OIDC permission is needed only by this job.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      # Download frontend artifact from this workflow run.
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: release/frontend
+
+      # Download backend artifact from this workflow run.
+      - name: Download backend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+          path: release/backend
+
+      # Package both builds for deployment.
+      - name: Create release archives
+        run: |
+          tar -czf frontend.tar.gz -C release/frontend .
+          tar -czf backend.tar.gz -C release/backend .
+
+          # Save release metadata for traceability.
+          printf '{"commit":"%s","run_id":"%s","run_number":"%s"}\n' \
+            "$GITHUB_SHA" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_NUMBER" > release-info.json
+
+      # Authenticate with AWS using GitHub OIDC.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Upload immutable, commit-specific release artifacts.
+      - name: Upload artifacts to S3
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          aws s3 cp frontend.tar.gz \
+            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/frontend.tar.gz"
+
+          aws s3 cp backend.tar.gz \
+            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/backend.tar.gz"
+
+          aws s3 cp release-info.json \
+            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/release-info.json"

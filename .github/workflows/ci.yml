@@ -54,7 +54,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Upload artifact only once from Node 22.
+      # Upload only the Node 22 build.
       - name: Upload frontend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -94,7 +94,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Generate Prisma Client without connecting to a database.
+      # Generate Prisma Client before tests and build.
       - name: Generate Prisma Client
         run: npm run prisma:generate
         env:
@@ -111,7 +111,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
 
-      # Upload artifact only once from Node 22.
+      # Upload everything required by production deployment.
       - name: Upload backend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -122,7 +122,9 @@ jobs:
             backend/src/generated/prisma/
             backend/package.json
             backend/package-lock.json
-            backend/prisma/
+            backend/prisma/schema.prisma
+            backend/prisma/migrations/
+            backend/prisma.config.ts
           if-no-files-found: error
           retention-days: 7
 
@@ -136,85 +138,78 @@ jobs:
       - frontend-ci
       - backend-ci
 
-    # Publish only after successful CI on main.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Only publish successful pushes to main.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
 
     runs-on: ubuntu-latest
 
-    # OIDC permission is required for AWS authentication.
     permissions:
       contents: read
       id-token: write
 
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      RELEASE_SHA: ${{ github.sha }}
+
     steps:
-      # Download frontend build from this workflow run.
+      # Download frontend artifact.
       - name: Download frontend artifact
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
           path: release/frontend
 
-      # Download backend build from this workflow run.
+      # Download backend artifact.
       - name: Download backend artifact
         uses: actions/download-artifact@v4
         with:
           name: backend-build
           path: release/backend
 
-      # Package release artifacts.
-      - name: Create release archives
-        run: |
-          set -euo pipefail
-
-          tar -czf frontend.tar.gz -C release/frontend .
-          tar -czf backend.tar.gz -C release/backend .
-
-          # Create release metadata for traceability.
-          printf '{"commit":"%s","run_id":"%s","run_number":"%s"}\n' \
-            "$GITHUB_SHA" \
-            "$GITHUB_RUN_ID" \
-            "$GITHUB_RUN_NUMBER" > release-info.json
-
-      # ======================================
-      # TEMPORARY OIDC DEBUGGING
-      # Remove this step after troubleshooting.
-      # ======================================
-      - name: Debug OIDC claims
+      # Validate the downloaded artifacts.
+      - name: Validate release artifacts
         shell: bash
         run: |
           set -euo pipefail
 
-          # Request an OIDC token for AWS STS.
-          TOKEN=$(curl -fsSL \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          test -f release/frontend/index.html
 
-          # Decode identity claims without printing the token.
-          OIDC_TOKEN="$TOKEN" python3 - <<'PY'
-          import os
-          import json
-          import base64
+          test -f release/backend/dist/server.js
 
-          token = os.environ["OIDC_TOKEN"]
+          test -f release/backend/dist/generated/prisma/client.js
 
-          payload = token.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
+          test -f release/backend/prisma/schema.prisma
 
-          claims = json.loads(
-              base64.urlsafe_b64decode(payload)
-          )
+          test -f release/backend/prisma.config.ts
 
-          for key in (
-              "iss",
-              "aud",
-              "sub",
-              "repository",
-              "ref",
-              "environment"
-          ):
-              print(f"{key}: {claims.get(key)}")
-          PY
+          test -d release/backend/prisma/migrations
+
+          test -f release/backend/package.json
+          test -f release/backend/package-lock.json
+
+          echo "All release artifacts validated."
+
+      # Package release artifacts.
+      - name: Create release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar -czf frontend.tar.gz \
+            -C release/frontend .
+
+          tar -czf backend.tar.gz \
+            -C release/backend .
+
+          printf '{"commit":"%s","run_id":"%s","run_number":"%s"}\n' \
+            "$RELEASE_SHA" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_NUMBER" > release-info.json
+
+          echo "Release archives created."
 
       # ======================================
       # AWS OIDC AUTHENTICATION
@@ -226,7 +221,6 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           audience: sts.amazonaws.com
 
-      # Verify temporary AWS credentials.
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
@@ -234,20 +228,21 @@ jobs:
       # UPLOAD ARTIFACTS TO S3
       # ======================================
       - name: Upload artifacts to S3
-        env:
-          S3_BUCKET: ${{ vars.S3_BUCKET }}
-          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Upload immutable, commit-specific release files.
           aws s3 cp frontend.tar.gz \
-            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/frontend.tar.gz"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/frontend.tar.gz" \
+            --region "$AWS_REGION"
 
           aws s3 cp backend.tar.gz \
-            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/backend.tar.gz"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/backend.tar.gz" \
+            --region "$AWS_REGION"
 
           aws s3 cp release-info.json \
-            "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/release-info.json"
+            "s3://${S3_BUCKET}/releases/${RELEASE_SHA}/release-info.json" \
+            --region "$AWS_REGION"
 
           echo "All release artifacts uploaded successfully."
+

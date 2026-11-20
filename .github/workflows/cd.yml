@@ -1,0 +1,171 @@
+name: TaskFlow CD
+
+on:
+  workflow_run:
+    workflows: ["TaskFlow CI"]
+    types: [completed]
+    branches: [main]
+
+# Prevent two production deployments from modifying the same EC2 instance.
+concurrency:
+  group: taskflow-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  approve-production:
+    name: Production Approval
+    runs-on: ubuntu-latest
+
+    # Deploy only successful pushes to main from this repository.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    # Configure required reviewers in GitHub:
+    # Settings -> Environments -> production -> Required reviewers.
+    environment:
+      name: production
+
+    steps:
+      - name: Approval granted
+        run: echo "Production deployment approval completed."
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: approve-production
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$AWS_REGION" == "ap-south-1" ]] || {
+            echo "ERROR: Unexpected AWS_REGION."
+            exit 1
+          }
+
+          [[ "$EC2_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]] || {
+            echo "ERROR: EC2_INSTANCE_ID is missing or invalid."
+            exit 1
+          }
+
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ERROR: RELEASE_SHA is invalid."
+            exit 1
+          }
+
+          # S3 bucket names are lowercase and 3-63 characters.
+          [[ "$S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || {
+            echo "ERROR: S3_BUCKET is missing or invalid."
+            exit 1
+          }
+
+          [[ -n "${{ vars.AWS_ROLE_ARN }}" ]] || {
+            echo "ERROR: AWS_ROLE_ARN repository variable is missing."
+            exit 1
+          }
+
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Send deployment command through SSM
+        id: deploy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Quote every value before passing the command to the remote shell.
+          printf -v remote_script \
+            'cd /opt/taskflow/shared && ./deploy.sh %q' \
+            "$RELEASE_SHA"
+
+          printf -v remote_command \
+            'sudo -iu ubuntu env S3_BUCKET=%q AWS_REGION=%q /bin/bash -lc %q' \
+            "$S3_BUCKET" \
+            "$AWS_REGION" \
+            "$remote_script"
+
+          PARAMETERS=$(jq -cn \
+            --arg command "$remote_command" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "TaskFlow deployment ${RELEASE_SHA}" \
+            --timeout-seconds 900 \
+            --max-errors "0" \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment and collect logs
+        shell: bash
+        env:
+          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          STATUS="Pending"
+
+          # Poll SSM for up to 15 minutes.
+          for attempt in $(seq 1 90); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success|Failed|TimedOut|Cancelled|Cancelling)
+                break
+                ;;
+              *)
+                sleep 10
+                ;;
+            esac
+          done
+
+          # Print remote output and errors to the GitHub Actions log.
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query '{Status:Status,ResponseCode:ResponseCode,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "ERROR: Deployment failed or timed out."
+            exit 1
+          fi
+
+          echo "Deployment completed successfully."

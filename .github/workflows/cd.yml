@@ -54,13 +54,19 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       S3_BUCKET: ${{ vars.S3_BUCKET }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-      RELEASE_SHA: ${{ inputs.commit_sha || github.event.workflow_run.head_sha }}
 
     steps:
       - name: Validate deployment configuration
+        id: validate
         shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.commit_sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -Eeuo pipefail
+
+          RAW_SHA="${INPUT_SHA:-$RUN_SHA}"
+          CLEAN_SHA="$(printf '%s' "$RAW_SHA" | tr -d '[:space:]/\r\n' | tr '[:upper:]' '[:lower:]')"
 
           [[ "$AWS_REGION" == "ap-south-1" ]] || {
             echo "ERROR: Unexpected AWS_REGION."
@@ -72,8 +78,8 @@ jobs:
             exit 1
           }
 
-          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "ERROR: RELEASE_SHA is invalid."
+          [[ "$CLEAN_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ERROR: RELEASE_SHA is invalid. RAW_SHA='${RAW_SHA}' CLEAN_SHA='${CLEAN_SHA}' (len=${#CLEAN_SHA})"
             exit 1
           }
 
@@ -86,6 +92,8 @@ jobs:
             echo "ERROR: AWS_ROLE_ARN repository variable is missing."
             exit 1
           }
+
+          echo "clean_sha=$CLEAN_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials using GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -100,8 +108,15 @@ jobs:
       - name: Send deployment command through SSM
         id: deploy
         shell: bash
+        env:
+          RELEASE_SHA: ${{ steps.validate.outputs.clean_sha }}
         run: |
           set -Eeuo pipefail
+
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ERROR: Missing validated RELEASE_SHA in deploy step."
+            exit 1
+          }
 
           printf -v remote_script \
             'cd /opt/taskflow/shared && ./deploy.sh deploy %q' \

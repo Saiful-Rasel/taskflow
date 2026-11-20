@@ -10,14 +10,14 @@ on:
     branches:
       - main
 
-# Default permissions for CI jobs.
+# Default permissions for all jobs.
 permissions:
   contents: read
 
 jobs:
-  # ------------------------------------------
+  # ==========================================
   # FRONTEND CI
-  # ------------------------------------------
+  # ==========================================
   frontend-ci:
     name: Frontend CI (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -54,7 +54,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Upload only once from Node 22.
+      # Upload artifact only once from Node 22.
       - name: Upload frontend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -64,9 +64,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ------------------------------------------
+  # ==========================================
   # BACKEND CI
-  # ------------------------------------------
+  # ==========================================
   backend-ci:
     name: Backend CI (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -94,7 +94,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Prisma Client generation does not require a running database.
+      # Generate Prisma Client without connecting to a database.
       - name: Generate Prisma Client
         run: npm run prisma:generate
         env:
@@ -111,7 +111,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/taskflow_ci
 
-      # Upload only once from Node 22.
+      # Upload artifact only once from Node 22.
       - name: Upload backend build
         if: matrix.node-version == 22
         uses: actions/upload-artifact@v4
@@ -126,67 +126,121 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ------------------------------------------
+  # ==========================================
   # PUBLISH ARTIFACTS TO AWS S3
-  # ------------------------------------------
+  # ==========================================
   publish-artifacts:
     name: Publish Artifacts to S3
 
-    # Run only after both CI jobs succeed.
     needs:
       - frontend-ci
       - backend-ci
 
-    # Never upload artifacts from pull requests.
+    # Publish only after successful CI on main.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     runs-on: ubuntu-latest
 
-    # OIDC permission is needed only by this job.
+    # OIDC permission is required for AWS authentication.
     permissions:
       contents: read
       id-token: write
 
     steps:
-      # Download frontend artifact from this workflow run.
+      # Download frontend build from this workflow run.
       - name: Download frontend artifact
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
           path: release/frontend
 
-      # Download backend artifact from this workflow run.
+      # Download backend build from this workflow run.
       - name: Download backend artifact
         uses: actions/download-artifact@v4
         with:
           name: backend-build
           path: release/backend
 
-      # Package both builds for deployment.
+      # Package release artifacts.
       - name: Create release archives
         run: |
+          set -euo pipefail
+
           tar -czf frontend.tar.gz -C release/frontend .
           tar -czf backend.tar.gz -C release/backend .
 
-          # Save release metadata for traceability.
+          # Create release metadata for traceability.
           printf '{"commit":"%s","run_id":"%s","run_number":"%s"}\n' \
             "$GITHUB_SHA" \
             "$GITHUB_RUN_ID" \
             "$GITHUB_RUN_NUMBER" > release-info.json
 
-      # Authenticate with AWS using GitHub OIDC.
+      # ======================================
+      # TEMPORARY OIDC DEBUGGING
+      # Remove this step after troubleshooting.
+      # ======================================
+      - name: Debug OIDC claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Request an OIDC token for AWS STS.
+          TOKEN=$(curl -fsSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+
+          # Decode identity claims without printing the token.
+          OIDC_TOKEN="$TOKEN" python3 - <<'PY'
+          import os
+          import json
+          import base64
+
+          token = os.environ["OIDC_TOKEN"]
+
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+
+          claims = json.loads(
+              base64.urlsafe_b64decode(payload)
+          )
+
+          for key in (
+              "iss",
+              "aud",
+              "sub",
+              "repository",
+              "ref",
+              "environment"
+          ):
+              print(f"{key}: {claims.get(key)}")
+          PY
+
+      # ======================================
+      # AWS OIDC AUTHENTICATION
+      # ======================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          audience: sts.amazonaws.com
 
-      # Upload immutable, commit-specific release artifacts.
+      # Verify temporary AWS credentials.
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # ======================================
+      # UPLOAD ARTIFACTS TO S3
+      # ======================================
       - name: Upload artifacts to S3
         env:
           S3_BUCKET: ${{ vars.S3_BUCKET }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
+          # Upload immutable, commit-specific release files.
           aws s3 cp frontend.tar.gz \
             "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/frontend.tar.gz"
 
@@ -195,3 +249,5 @@ jobs:
 
           aws s3 cp release-info.json \
             "s3://${S3_BUCKET}/releases/${COMMIT_SHA}/release-info.json"
+
+          echo "All release artifacts uploaded successfully."

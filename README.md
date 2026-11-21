@@ -1,10 +1,10 @@
 # ShopNest — Automated CI/CD & Blue-Green Deployment
 
-<p align="center">
+
 
 **Production-Ready Three-Tier Application | AWS | GitHub Actions | Docker | Nginx | Blue-Green Deployment**
 
-</p>
+
 
 ShopNest is a three-tier web application deployed on AWS EC2 using an automated GitHub Actions CI/CD pipeline. It implements Blue-Green deployment to minimize downtime, automated health checks, release traceability, and automatic rollback.
 
@@ -388,8 +388,8 @@ ShopNest uses separate CI and CD workflows.
 
 | Workflow | Responsibility |
 |---|---|
-| `ci.yml` | Validate frontend and backend |
-| `cd.yml` | Deploy validated artifacts |
+| `ci.yml` | Validate frontend and backend and push into aws s3 bucket|
+| `cd.yml` | first check oidc connection then login server ssm role and then download s3 bucket commit sha and install all dependencies and project structure |
 | `rollback.yml` | Manually restore a previous release, if implemented |
 
 ## 5.2 CI Workflow Jobs
@@ -513,6 +513,7 @@ Document the actual secrets configured in the repository.
 | `EC2_SSH_KEY` | SSH private key, only if SSH-key authentication is used |
 | `DB_PASSWORD` | Database password, if required by the workflow |
 | `STAGING_DB_PASSWORD` | Staging database password, if required |
+| `PRODUCTION_DB_PASSWORD` | Production database password, if required |G_DB_PASSWORD` | Staging database password, if required |
 | `PRODUCTION_DB_PASSWORD` | Production database password, if required |
 
 Remove entries that are not actually used.
@@ -1163,6 +1164,8 @@ Corrected the application logic or test implementation.
 
 ### Failure 3 — Deployment Connection Failure
 
+## i face more then 30 time but no proof 
+
 **Expected error:**
 
 ```text
@@ -1464,21 +1467,20 @@ All evidence must be committed to the repository.
 
 ## Blue-Green Deployment
 
-![Blue Green Deployment](docs/screenshots/blue-green-deployment.png)
+![Blue  Deployment](docs/screenshots/blue.png)
+![green Deployment](docs/screenshots/green.png)
+
 
 ## Zero-Downtime Verification
 
-![Zero Downtime Test](docs/screenshots/zero-downtime-test.png)
+![Zero Downtime Test](docs/screenshots/zero-downtime.png)
 
-## Automatic Rollback
+## manual Rollback
+## here when i want to comeback before release i put a commit sha in my cd 
 
-![Automatic Rollback](docs/screenshots/automatic-rollback.png)
+![manual Rollback](docs/screenshots/manual-rollback.png)
 
 ## Failed Workflow Runs
-
-![YAML Failure](docs/screenshots/yaml-failure.png)
-
-![Test Failure](docs/screenshots/test-failure.png)
 
 ![Deployment Failure](docs/screenshots/deployment-failure.png)
 
